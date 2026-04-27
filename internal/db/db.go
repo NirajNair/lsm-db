@@ -20,7 +20,6 @@ type Db[K comparable, V any] struct {
 func NewDb[K comparable, V any](maxMemTableSize int) (*Db[K, V], error) {
 	memTable := memtable.NewMemTable[K, V]()
 	ssTables := make([]*sstable.SSTable[K, V], 0)
-
 	return &Db[K, V]{
 		memTable:        memTable,
 		maxMemTableSize: maxMemTableSize,
@@ -44,11 +43,14 @@ func (db *Db[K, V]) Put(key K, value V) error {
 }
 
 func (db *Db[K, V]) Get(key K) (V, error) {
+	var zero V
+
 	if val, ok := db.memTable.Get(key); ok {
+		if any(val).(string) == sstable.TOMBSTONE {
+			return zero, errs.ErrKeyDeleted
+		}
 		return val, nil
 	}
-
-	var zero V
 
 	// Read the newest SSTable first
 	for i := len(db.ssTables) - 1; i >= 0; i-- {
@@ -67,6 +69,14 @@ func (db *Db[K, V]) Get(key K) (V, error) {
 	}
 
 	return zero, fmt.Errorf("Key %v not found", key)
+}
+
+func (db *Db[K, V]) Delete(key K) error {
+	if err := db.Put(key, any(sstable.TOMBSTONE).(V)); err != nil {
+		return err
+	}
+	log.Printf("Key %v deleted!", key)
+	return nil
 }
 
 func (db *Db[K, V]) flushMemTable() error {
