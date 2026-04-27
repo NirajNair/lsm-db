@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/NirajNair/lsm-db/internal/errs"
+	"github.com/NirajNair/lsm-db/internal/fsutil"
 	"github.com/NirajNair/lsm-db/internal/memtable"
 )
 
@@ -23,11 +24,10 @@ type Pair[K comparable, V any] struct {
 }
 
 func WriteSST[K comparable, V any](memTable *memtable.MemTable[K, V], path string) (*SSTable[K, V], error) {
-	file, err := os.Create(path)
+	tmpFile, err := os.Create(path + ".tmp")
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
 	pairs := make([]Pair[K, V], 0, len(memTable.Data))
 	for k, v := range memTable.Data {
@@ -38,11 +38,21 @@ func WriteSST[K comparable, V any](memTable *memtable.MemTable[K, V], path strin
 		return any(pairs[i].Key).(string) < any(pairs[j].Key).(string)
 	})
 
-	encoder := gob.NewEncoder(file)
+	encoder := gob.NewEncoder(tmpFile)
 	for _, pair := range pairs {
 		if err := encoder.Encode(pair); err != nil {
 			return nil, err
 		}
+	}
+
+	tmpFile.Close()
+
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return nil, err
+	}
+
+	if err := fsutil.SyncDir(path); err != nil {
+		return nil, err
 	}
 
 	return &SSTable[K, V]{path: path}, nil

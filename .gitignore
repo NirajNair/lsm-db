@@ -37,3 +37,6 @@ go.work.sum
 docs/
 build/
 .DS_Store
+
+data/sst/
+data/wal/

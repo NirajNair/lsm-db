@@ -7,13 +7,20 @@ import (
 )
 
 func main() {
-	db, err := db.NewDb[string, string](2)
+	db, err := db.NewDB[string, string](2)
 	if err != nil {
 		log.Fatalf("Failed to create DB: %v", err)
 	}
-	db.Put("a", "apple")
-	db.Put("b", "ball")
-	db.Put("c", "cat")
+	if err := db.Put("a", "apple"); err != nil {
+		log.Fatalf("Failed to PUT in DB: %v", err)
+	}
+	if err := db.Put("b", "ball"); err != nil {
+		log.Fatalf("Failed to PUT in DB: %v", err)
+	}
+	if err := db.Put("c", "cat"); err != nil {
+		log.Fatalf("Failed to PUT in DB: %v", err)
+	}
+
 	val, _ := db.Get("a")
 	log.Printf("Get('a') = %s, expected 'apple'", val)
 	val, _ = db.Get("b")
