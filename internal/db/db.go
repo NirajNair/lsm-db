@@ -75,6 +75,15 @@ func (db *DB[K, V]) Put(key K, value V) error {
 	return nil
 }
 
+func (db *DB[K, V]) Update(key K, value V) error {
+	if err := db.Put(key, value); err != nil {
+		return err
+	}
+	log.Printf("Key %v updated!", key)
+
+	return nil
+}
+
 func (db *DB[K, V]) Get(key K) (V, error) {
 	var zero V
 
