@@ -7,31 +7,33 @@ import (
 	"os"
 	"sort"
 
+	types "github.com/NirajNair/lsm-db/internal"
 	"github.com/NirajNair/lsm-db/internal/errs"
-	"github.com/NirajNair/lsm-db/internal/fsutil"
 	"github.com/NirajNair/lsm-db/internal/memtable"
+	"github.com/NirajNair/lsm-db/internal/utils"
 )
 
 const TOMBSTONE = "--TOMBSTONE--"
 
 type SSTable[K comparable, V any] struct {
-	path string
+	Path string
 }
 
-type Pair[K comparable, V any] struct {
-	Key   K
-	Value V
+type WriteResult[K comparable, V any] struct {
+	SST    *SSTable[K, V]
+	MinKey []byte
+	MaxKey []byte
 }
 
-func WriteSST[K comparable, V any](memTable *memtable.MemTable[K, V], path string) (*SSTable[K, V], error) {
+func WriteSST[K comparable, V any](memTable *memtable.MemTable[K, V], path string) (*WriteResult[K, V], error) {
 	tmpFile, err := os.Create(path + ".tmp")
 	if err != nil {
 		return nil, err
 	}
 
-	pairs := make([]Pair[K, V], 0, len(memTable.Data))
+	pairs := make([]types.Pair[K, V], 0, len(memTable.Data))
 	for k, v := range memTable.Data {
-		pairs = append(pairs, Pair[K, V]{Key: k, Value: v})
+		pairs = append(pairs, types.Pair[K, V]{Key: k, Value: v})
 	}
 
 	sort.Slice(pairs, func(i int, j int) bool {
@@ -45,24 +47,39 @@ func WriteSST[K comparable, V any](memTable *memtable.MemTable[K, V], path strin
 		}
 	}
 
-	tmpFile.Close()
+	if err := tmpFile.Sync(); err != nil {
+		return nil, err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, err
+	}
 
 	if err := os.Rename(path+".tmp", path); err != nil {
 		return nil, err
 	}
 
-	if err := fsutil.SyncDir(path); err != nil {
+	if err := utils.SyncDir(path); err != nil {
 		return nil, err
 	}
 
-	return &SSTable[K, V]{path: path}, nil
+	var minKey, maxKey []byte
+	if len(pairs) > 0 {
+		minKey = []byte(any(pairs[0].Key).(string))
+		maxKey = []byte(any(pairs[len(pairs)-1].Key).(string))
+	}
+
+	return &WriteResult[K, V]{
+		SST:    &SSTable[K, V]{Path: path},
+		MinKey: minKey,
+		MaxKey: maxKey,
+	}, nil
 }
 
 func (sst *SSTable[K, V]) Get(key K) (V, error) {
 	var zero V
 
-	log.Printf("Searching Key: %v in SSTable: %s", key, sst.path)
-	file, err := os.Open(sst.path)
+	log.Printf("Searching Key: %v in SSTable: %s", key, sst.Path)
+	file, err := os.Open(sst.Path)
 	if err != nil {
 		return zero, err
 	}
@@ -71,12 +88,12 @@ func (sst *SSTable[K, V]) Get(key K) (V, error) {
 	decoder := gob.NewDecoder(file)
 
 	for {
-		var pair Pair[K, V]
+		var pair types.Pair[K, V]
 		if err := decoder.Decode(&pair); err != nil {
 			if err == io.EOF {
 				break
 			}
-			return zero, nil
+			return zero, err
 		}
 
 		storedKey := any(pair.Key).(string)

@@ -6,8 +6,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/NirajNair/lsm-db/internal/fsutil"
+	types "github.com/NirajNair/lsm-db/internal"
 	"github.com/NirajNair/lsm-db/internal/memtable"
+	"github.com/NirajNair/lsm-db/internal/utils"
 )
 
 type WAL[K comparable, V any] struct {
@@ -15,17 +16,12 @@ type WAL[K comparable, V any] struct {
 	encoder *gob.Encoder
 }
 
-type WALEntry[K comparable, V any] struct {
-	Key   K
-	Value V
-}
-
 func NewWAL[K comparable, V any](path string) (*WAL[K, V], error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
 
-	if err := fsutil.SyncDir(path); err != nil {
+	if err := utils.SyncDir(path); err != nil {
 		return nil, err
 	}
 
@@ -40,27 +36,42 @@ func NewWAL[K comparable, V any](path string) (*WAL[K, V], error) {
 	}, nil
 }
 
-func (w *WAL[K, V]) Write(key K, value V) error {
-	entry := &WALEntry[K, V]{Key: key, Value: value}
-	if err := w.encoder.Encode(entry); err != nil {
-		return err
+func (w *WAL[K, V]) Write(key K, value V) (int, error) {
+	entry := &types.Pair[K, V]{Key: key, Value: value}
+	currentOffset, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
 	}
-	return w.file.Sync()
+	if err := w.encoder.Encode(entry); err != nil {
+		return 0, err
+	}
+	if err := w.file.Sync(); err != nil {
+		return 0, err
+	}
+	newOffset, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	return int(newOffset - currentOffset), nil
 }
 
 func (w *WAL[K, V]) Close() error {
-	if err := w.file.Close(); err != nil {
+	if err := w.file.Sync(); err != nil {
 		return err
 	}
-	return nil
+	return w.file.Close()
 }
 
 func ReplayWAL[K comparable, V any](path string) (*memtable.MemTable[K, V], error) {
 	memTable := memtable.NewMemTable[K, V]()
 
 	// Return the empty MemTable if WAL file does not exist
-	if _, err := os.Stat(path); err != nil {
-		return memTable, nil
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return memTable, nil
+		}
+		return nil, err
 	}
 
 	file, err := os.Open(path)
@@ -71,7 +82,7 @@ func ReplayWAL[K comparable, V any](path string) (*memtable.MemTable[K, V], erro
 
 	decoder := gob.NewDecoder(file)
 	for {
-		var entry WALEntry[K, V]
+		var entry types.Pair[K, V]
 		if err := decoder.Decode(&entry); err != nil {
 			if err == io.EOF {
 				break
@@ -80,6 +91,6 @@ func ReplayWAL[K comparable, V any](path string) (*memtable.MemTable[K, V], erro
 		}
 		memTable.Put(entry.Key, entry.Value)
 	}
-
+	memTable.Size = uint(fileInfo.Size())
 	return memTable, nil
 }
