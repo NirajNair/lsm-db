@@ -24,16 +24,16 @@ const (
 	manifestPath = "data/MANIFEST"
 )
 
-type DB[K comparable, V any] struct {
+type DB struct {
 	mu              sync.RWMutex
-	memTable        *memtable.MemTable[K, V]
+	memTable        *memtable.MemTable
 	maxMemTableSize uint
-	wal             *wal.WAL[K, V]
+	wal             *wal.WAL
 	walPath         string
 	manifest        *manifest.Manifest
 }
 
-func NewDB[K comparable, V any](maxMemTableSize uint) (*DB[K, V], error) {
+func NewDB(maxMemTableSize uint) (*DB, error) {
 	if err := cleanupTmpFiles(sstDir); err != nil {
 		return nil, err
 	}
@@ -49,26 +49,26 @@ func NewDB[K comparable, V any](maxMemTableSize uint) (*DB[K, V], error) {
 		return nil, err
 	}
 
-	memTable, err := wal.ReplayWAL[K, V](walFilePath)
+	memTable, err := wal.ReplayWAL(walFilePath)
 	if err != nil {
 		return nil, err
 	}
 
-	wal, err := wal.NewWAL[K, V](walFilePath)
+	walFile, err := wal.NewWAL(walFilePath)
 	if err != nil {
 		return nil, err
 	}
 
-	return &DB[K, V]{
+	return &DB{
 		memTable:        memTable,
 		maxMemTableSize: maxMemTableSize,
-		wal:             wal,
+		wal:             walFile,
 		walPath:         walFilePath,
 		manifest:        m,
 	}, nil
 }
 
-func (db *DB[K, V]) Put(key K, value V) error {
+func (db *DB) Put(key, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -76,12 +76,15 @@ func (db *DB[K, V]) Put(key K, value V) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("Written {'%v': '%v'} to WAL (encoded size: %d bytes)", key, value, size)
+	log.Printf("Written key to WAL (encoded size: %d bytes)", size)
 
-	if err := db.memTable.Put(key, value, uint(size)); err != nil {
+	// TODO: Remove string conversion one Skip List is implemented
+	// MemTable uses string keys internally (map[string][]byte) until
+	// skip list is implemented. string(key) is a zero-cost reinterpretation.
+	if err := db.memTable.Put(string(key), value, uint(size)); err != nil {
 		return err
 	}
-	log.Printf("Added {'%v': '%v'} to MemTable", key, value)
+	log.Printf("Added key to MemTable")
 
 	if db.memTable.Size >= db.maxMemTableSize {
 		if err := db.flushMemTable(); err != nil {
@@ -92,27 +95,26 @@ func (db *DB[K, V]) Put(key K, value V) error {
 	return nil
 }
 
-func (db *DB[K, V]) Update(key K, value V) error {
+func (db *DB) Update(key, value []byte) error {
 	return db.Put(key, value)
 }
 
-func (db *DB[K, V]) Get(key K) (V, error) {
+func (db *DB) Get(key []byte) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	var zero V
-
-	if val, ok := db.memTable.Get(key); ok {
-		if any(val).(string) == sstable.TOMBSTONE {
-			return zero, errs.ErrKeyDeleted
+	// TODO: Remove string conversion one Skip List is implemented
+	// MemTable uses string keys internally until skip list is implemented.
+	if val, ok := db.memTable.Get(string(key)); ok {
+		if sstable.IsTombstone(val) {
+			return nil, errs.ErrKeyDeleted
 		}
 		return val, nil
 	}
 
 	// Search SSTables via manifest, level by level.
-	// L0: newest files first, may contain overlapping keys.
-	// L1+: non-overlapping, can skip files whose range excludes the key.
-	keyBytes := []byte(any(key).(string))
+	// Keys are raw bytes — the application is responsible for encoding
+	keyBytes := key
 
 	for _, level := range db.manifest.Levels {
 		if level.Level == manifest.LevelZero {
@@ -123,15 +125,15 @@ func (db *DB[K, V]) Get(key K) (V, error) {
 				if !keyInRange(keyBytes, f.MinKey, f.MaxKey) {
 					continue
 				}
-				val, err := (&sstable.SSTable[K, V]{Path: f.Path}).Get(key)
+				val, err := (&sstable.SSTable{Path: f.Path}).Get(key)
 				if err != nil {
 					if err == errs.ErrKeyDeleted {
-						return zero, errs.ErrKeyNotFound
+						return nil, errs.ErrKeyNotFound
 					}
 					if err == errs.ErrKeyNotFound {
 						continue
 					}
-					return zero, err
+					return nil, err
 				}
 				return val, nil
 			}
@@ -142,15 +144,15 @@ func (db *DB[K, V]) Get(key K) (V, error) {
 			if idx >= 0 {
 				f := level.Files[idx]
 				if keyInRange(keyBytes, f.MinKey, f.MaxKey) {
-					val, err := (&sstable.SSTable[K, V]{Path: f.Path}).Get(key)
+					val, err := (&sstable.SSTable{Path: f.Path}).Get(key)
 					if err != nil {
 						if err == errs.ErrKeyDeleted {
-							return zero, errs.ErrKeyNotFound
+							return nil, errs.ErrKeyNotFound
 						}
 						if err == errs.ErrKeyNotFound {
 							continue
 						}
-						return zero, err
+						return nil, err
 					}
 					return val, nil
 				}
@@ -158,14 +160,14 @@ func (db *DB[K, V]) Get(key K) (V, error) {
 		}
 	}
 
-	return zero, fmt.Errorf("key %v not found", key)
+	return nil, fmt.Errorf("key %v not found", key)
 }
 
-func (db *DB[K, V]) Delete(key K) error {
-	return db.Put(key, any(sstable.TOMBSTONE).(V))
+func (db *DB) Delete(key []byte) error {
+	return db.Put(key, sstable.TOMBSTONE)
 }
 
-func (db *DB[K, V]) rotateWAL() (string, error) {
+func (db *DB) rotateWAL() (string, error) {
 	if err := db.wal.Close(); err != nil {
 		return "", err
 	}
@@ -184,7 +186,7 @@ func (db *DB[K, V]) rotateWAL() (string, error) {
 		return "", err
 	}
 
-	newWAL, err := wal.NewWAL[K, V](db.walPath)
+	newWAL, err := wal.NewWAL(db.walPath)
 	if err != nil {
 		return "", err
 	}
@@ -194,7 +196,7 @@ func (db *DB[K, V]) rotateWAL() (string, error) {
 	return rotatedPath, nil
 }
 
-func (db *DB[K, V]) flushMemTable() error {
+func (db *DB) flushMemTable() error {
 	ssTablePath := fmt.Sprintf("%s/data-%d.sstable", sstDir, db.manifest.SSTSeqNum)
 	if err := os.MkdirAll(filepath.Dir(ssTablePath), 0755); err != nil {
 		return err
@@ -229,7 +231,7 @@ func (db *DB[K, V]) flushMemTable() error {
 	}
 	log.Println("Successfully rotated WAL!")
 
-	db.memTable = memtable.NewMemTable[K, V]()
+	db.memTable = memtable.NewMemTable()
 
 	return nil
 }

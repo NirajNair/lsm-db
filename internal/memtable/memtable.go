@@ -1,17 +1,17 @@
 package memtable
 
-type MemTable[K comparable, V any] struct {
-	Data map[K]V
+type MemTable struct {
+	Data map[string][]byte
 	Size uint
 }
 
-func NewMemTable[K comparable, V any]() *MemTable[K, V] {
-	return &MemTable[K, V]{
-		Data: make(map[K]V),
+func NewMemTable() *MemTable {
+	return &MemTable{
+		Data: make(map[string][]byte),
 	}
 }
 
-func (m *MemTable[K, V]) Put(key K, value V, opts ...uint) error {
+func (m *MemTable) Put(key string, value []byte, opts ...uint) error {
 	m.Data[key] = value
 
 	if len(opts) > 0 && opts[0] > 0 {
@@ -21,11 +21,10 @@ func (m *MemTable[K, V]) Put(key K, value V, opts ...uint) error {
 	return nil
 }
 
-func (m *MemTable[K, V]) Get(key K) (V, bool) {
+func (m *MemTable) Get(key string) ([]byte, bool) {
 	value, ok := m.Data[key]
-	var zero V
 	if !ok {
-		return zero, false
+		return nil, false
 	}
 	return value, true
 }

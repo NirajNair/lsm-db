@@ -1,34 +1,35 @@
 package main
 
 import (
+	"fmt"
 	"log"
 
 	"github.com/NirajNair/lsm-db/internal/db"
 )
 
 func main() {
-	db, err := db.NewDB[string, string](2)
+	database, err := db.NewDB(2)
 	if err != nil {
 		log.Fatalf("Failed to create DB: %v", err)
 	}
-	if err := db.Put("a", "apple"); err != nil {
+	if err := database.Put([]byte("a"), []byte("apple")); err != nil {
 		log.Fatalf("Failed to PUT in DB: %v", err)
 	}
-	if err := db.Put("b", "ball"); err != nil {
+	if err := database.Put([]byte("b"), []byte("ball")); err != nil {
 		log.Fatalf("Failed to PUT in DB: %v", err)
 	}
-	if err := db.Put("c", "cat"); err != nil {
+	if err := database.Put([]byte("c"), []byte("cat")); err != nil {
 		log.Fatalf("Failed to PUT in DB: %v", err)
 	}
 
-	val, _ := db.Get("a")
-	log.Printf("Get('a') = %s, expected 'apple'", val)
-	val, _ = db.Get("b")
-	log.Printf("Get('b') = %s, expected 'ball')", val)
-	val, _ = db.Get("c")
-	log.Printf("Get('c') = %s, expected 'cat')", val)
-	db.Delete("b")
-	_, err = db.Get("b")
+	val, _ := database.Get([]byte("a"))
+	fmt.Printf("Get('a') = %s, expected 'apple'\n", val)
+	val, _ = database.Get([]byte("b"))
+	fmt.Printf("Get('b') = %s, expected 'ball'\n", val)
+	val, _ = database.Get([]byte("c"))
+	fmt.Printf("Get('c') = %s, expected 'cat'\n", val)
+	database.Delete([]byte("b"))
+	_, err = database.Get([]byte("b"))
 	if err != nil {
 		log.Println(err.Error())
 	}
