@@ -78,10 +78,7 @@ func (db *DB) Put(key, value []byte) error {
 	}
 	log.Printf("Written key to WAL (encoded size: %d bytes)", size)
 
-	// TODO: Remove string conversion one Skip List is implemented
-	// MemTable uses string keys internally (map[string][]byte) until
-	// skip list is implemented. string(key) is a zero-cost reinterpretation.
-	if err := db.memTable.Put(string(key), value, uint(size)); err != nil {
+	if err := db.memTable.Put(key, value, uint(size)); err != nil {
 		return err
 	}
 	log.Printf("Added key to MemTable")
@@ -103,9 +100,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	// TODO: Remove string conversion one Skip List is implemented
-	// MemTable uses string keys internally until skip list is implemented.
-	if val, ok := db.memTable.Get(string(key)); ok {
+	if val, ok := db.memTable.Get(key); ok {
 		if sstable.IsTombstone(val) {
 			return nil, errs.ErrKeyDeleted
 		}

@@ -89,10 +89,7 @@ func ReplayWAL(path string) (*memtable.MemTable, error) {
 			}
 			return nil, err
 		}
-		// TODO: Remove string conversion one Skip List is implemented
-		// MemTable uses string keys internally (map[string][]byte).
-		// string(entry.Key) is a zero-cost reinterpretation, not a text conversion.
-		memTable.Put(string(entry.Key), entry.Value)
+		memTable.Put(entry.Key, entry.Value)
 	}
 	memTable.Size = uint(fileInfo.Size())
 	return memTable, nil

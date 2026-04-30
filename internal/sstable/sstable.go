@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"sort"
 
 	types "github.com/NirajNair/lsm-db/internal"
 	"github.com/NirajNair/lsm-db/internal/errs"
@@ -40,35 +39,29 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 		return nil, err
 	}
 
-	// Collect entries for sorting.
-	type sortedEntry struct {
-		key   []byte
-		value []byte
-	}
-
-	entries := make([]sortedEntry, 0, len(memTable.Data))
-	for k, v := range memTable.Data {
-		entries = append(entries, sortedEntry{
-			key:   []byte(k),
-			value: v,
-		})
-	}
-
-	// Sort by raw key bytes — the application is responsible for
-	// encoding keys in the desired ordering (big-endian for integers, etc).
-	sort.Slice(entries, func(i, j int) bool {
-		return bytes.Compare(entries[i].key, entries[j].key) < 0
-	})
-
 	encoder := gob.NewEncoder(tmpFile)
-	for _, entry := range entries {
+	var minKey, maxKey []byte
+	first := true
+
+	err = memTable.ForEach(func(key, value []byte) error {
 		pair := types.Entry{
-			Key:   entry.key,
-			Value: entry.value,
+			Key:   key,
+			Value: value,
 		}
 		if err := encoder.Encode(pair); err != nil {
-			return nil, err
+			return err
 		}
+		if first {
+			minKey = key
+			first = false
+		}
+		maxKey = key
+		return nil
+	})
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(path + ".tmp")
+		return nil, err
 	}
 
 	if err := tmpFile.Sync(); err != nil {
@@ -84,12 +77,6 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 
 	if err := utils.SyncDir(path); err != nil {
 		return nil, err
-	}
-
-	var minKey, maxKey []byte
-	if len(entries) > 0 {
-		minKey = entries[0].key
-		maxKey = entries[len(entries)-1].key
 	}
 
 	return &WriteResult{
