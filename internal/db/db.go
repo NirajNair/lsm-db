@@ -227,6 +227,7 @@ func (db *DB) rotateMemTable() error {
 }
 
 func (db *DB) flushRotatedMemTable() error {
+	immutableRotatedMemTable := db.rotatedMemTable
 	ssTablePath := fmt.Sprintf("%s/data-%d.sstable", sstDir, db.manifest.SSTSeqNum)
 	if err := os.MkdirAll(filepath.Dir(ssTablePath), 0755); err != nil {
 		return err
@@ -237,10 +238,12 @@ func (db *DB) flushRotatedMemTable() error {
 	}
 
 	log.Printf("Flushing MemTable to file %s", ssTablePath)
-	result, err := sstable.WriteSST(db.rotatedMemTable, ssTablePath)
+	result, err := sstable.WriteSST(immutableRotatedMemTable, ssTablePath)
 	if err != nil {
 		return err
 	}
+
+	db.mu.Lock()
 	db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
 	db.manifest.SSTSeqNum++
 
@@ -250,6 +253,7 @@ func (db *DB) flushRotatedMemTable() error {
 	log.Println("Successfully flushed MemTable!")
 
 	db.rotatedMemTable = nil
+	db.mu.Unlock()
 
 	// Cleans stale rotated WALs in Background
 	go func() {
@@ -320,18 +324,20 @@ func cleanupTmpFiles(dir string) error {
 
 func cleanupStaleWALs(m *manifest.Manifest) error {
 	if len(m.FlushedWALs) == 0 {
-		return errors.New("No rotated WALs found")
+		return nil
 	}
 
 	for len(m.FlushedWALs) != 0 {
 		wal := m.FlushedWALs[0]
 		log.Printf("Cleaning up stale rotated WAL: %s", wal.Path)
-		if err := os.Remove(wal.Path); err !=
-			nil {
-			return err
+		if err := os.Remove(wal.Path); err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
 		}
 		m.FlushedWALs = m.FlushedWALs[1:]
 	}
 
 	return nil
+
 }
