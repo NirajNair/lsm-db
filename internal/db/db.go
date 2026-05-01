@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/NirajNair/lsm-db/internal/errs"
 	"github.com/NirajNair/lsm-db/internal/manifest"
@@ -32,6 +33,8 @@ type DB struct {
 	wal             *wal.WAL
 	walPath         string
 	manifest        *manifest.Manifest
+	flushDone       sync.Cond
+	flushErr        error
 }
 
 func NewDB(maxMemTableSize uint) (*DB, error) {
@@ -82,21 +85,22 @@ func (db *DB) Put(key, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.memTable.Size >= db.maxMemTableSize {
+	for db.memTable.Size >= db.maxMemTableSize {
 		if db.rotatedMemTable != nil {
-			return errors.New("MemTable is full, cannot write to DB")
+			// Unlocks mutex and waits for backgound flush to finish
+			db.flushDone.Wait()
+			if db.flushErr != nil {
+				return fmt.Errorf("DB flush error: %w", db.flushErr)
+			}
+			continue
 		}
 
 		if err := db.rotateMemTable(); err != nil {
 			return err
 		}
-		db.memTable = memtable.NewMemTable()
 
-		go func() {
-			if err := db.flushRotatedMemTable(); err != nil {
-				fmt.Printf("Failed flushing rotated MemTable: %v", err.Error())
-			}
-		}()
+		db.memTable = memtable.NewMemTable()
+		go db.flushRotatedMemTableAndCleanup()
 	}
 
 	size, err := db.wal.Write(key, value)
@@ -233,6 +237,30 @@ func (db *DB) rotateMemTable() error {
 
 	db.rotatedMemTable = db.memTable
 	return nil
+}
+
+func (db *DB) flushRotatedMemTableAndCleanup() {
+	const maxRetries = 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(1<<uint(i)) * 500 * time.Millisecond)
+			// 500ms, 1s, 2s
+			log.Printf("Retrying flush (attempt %d/%d)...", i+1, maxRetries)
+		}
+		lastErr = db.flushRotatedMemTable()
+		if lastErr == nil {
+			db.flushDone.Broadcast()
+			return
+		}
+		log.Printf("Flush attempt %d failed: %v", i+1, lastErr)
+	}
+
+	// All retries exhausted — set error state
+	db.mu.Lock()
+	db.flushErr = lastErr
+	db.mu.Unlock()
+	db.flushDone.Broadcast() // wake any waiting Put() calls
 }
 
 func (db *DB) flushRotatedMemTable() error {
