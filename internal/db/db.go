@@ -55,6 +55,14 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 		return nil, err
 	}
 
+	var rotatedMemTable *memtable.MemTable
+	if len(m.RotatedWALs) != 0 {
+		rotatedMemTable, err = wal.ReplayWAL(m.RotatedWALs[0].Path)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	walFile, err := wal.NewWAL(walFilePath)
 	if err != nil {
 		return nil, err
@@ -62,6 +70,7 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 
 	return &DB{
 		memTable:        memTable,
+		rotatedMemTable: rotatedMemTable,
 		maxMemTableSize: maxMemTableSize,
 		wal:             walFile,
 		walPath:         walFilePath,
@@ -197,7 +206,7 @@ func (db *DB) rotateWAL() (string, error) {
 		return "", err
 	}
 
-	db.manifest.AddFlushedWAL(rotatedPath)
+	db.manifest.AddRotatedWAL(rotatedPath)
 	db.manifest.WALSeqNum++
 
 	if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
@@ -253,6 +262,8 @@ func (db *DB) flushRotatedMemTable() error {
 	log.Println("Successfully flushed MemTable!")
 
 	db.rotatedMemTable = nil
+	db.manifest.FlushedWALs = append(db.manifest.FlushedWALs, db.manifest.RotatedWALs[0])
+	db.manifest.RotatedWALs = db.manifest.RotatedWALs[1:]
 	db.mu.Unlock()
 
 	// Cleans stale rotated WALs in Background

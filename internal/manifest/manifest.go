@@ -25,11 +25,12 @@ const (
 type Manifest struct {
 	SSTSeqNum   uint
 	WALSeqNum   uint
-	FlushedWALs []*FlushedWAL
+	RotatedWALs []*WAL
+	FlushedWALs []*WAL
 	Levels      []*LevelMetadata
 }
 
-type FlushedWAL struct {
+type WAL struct {
 	Path string
 }
 
@@ -63,7 +64,7 @@ func NewManifest() *Manifest {
 	}
 
 	return &Manifest{
-		FlushedWALs: make([]*FlushedWAL, 0),
+		FlushedWALs: make([]*WAL, 0),
 		Levels:      levels,
 	}
 }
@@ -147,8 +148,14 @@ func (m *Manifest) AddSSTable(path string, level LevelNum, optKeys ...[]byte) er
 	return nil
 }
 
+// Adds rotated WALs path to Manifest.
+func (m *Manifest) AddRotatedWAL(path string) error {
+	m.RotatedWALs = append(m.RotatedWALs, &WAL{Path: path})
+	return nil
+}
+
 // Adds flushed WALs path to Manifest.
 func (m *Manifest) AddFlushedWAL(path string) error {
-	m.FlushedWALs = append(m.FlushedWALs, &FlushedWAL{Path: path})
+	m.FlushedWALs = append(m.FlushedWALs, &WAL{Path: path})
 	return nil
 }
