@@ -35,6 +35,8 @@ type DB struct {
 	manifest        *manifest.Manifest
 	flushDone       sync.Cond
 	flushErr        error
+	flushWg         sync.WaitGroup
+	closed          bool
 }
 
 func NewDB(maxMemTableSize uint) (*DB, error) {
@@ -100,7 +102,13 @@ func (db *DB) Put(key, value []byte) error {
 		}
 
 		db.memTable = memtable.NewMemTable()
-		go db.flushRotatedMemTableAndCleanup()
+
+		// Add the background job to WaitGroup to support graceful shutdown
+		db.flushWg.Add(1)
+		go func() {
+			defer db.flushWg.Done()
+			db.flushRotatedMemTableAndCleanup()
+		}()
 	}
 
 	size, err := db.wal.Write(key, value)
@@ -194,6 +202,38 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 func (db *DB) Delete(key []byte) error {
 	return db.Put(key, sstable.TOMBSTONE)
+}
+
+func (db *DB) Close() error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return nil
+	}
+	db.closed = true
+
+	db.mu.Unlock()
+	// Wait for any background flushing operations to finish
+	db.flushWg.Wait()
+	db.mu.Lock()
+
+	// Flush the current MemTable synchronously if it has data.
+	if db.memTable.Size > 0 {
+		ssTablePath := fmt.Sprintf("%s/data-%d.sstable", sstDir, db.manifest.SSTSeqNum)
+		result, err := sstable.WriteSST(db.memTable, ssTablePath)
+		if err != nil {
+			db.mu.Unlock()
+			return err
+		}
+		db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
+		db.manifest.SSTSeqNum++
+		manifest.WriteToFile(manifestPath, db.manifest)
+	}
+
+	// Close the WAL.
+	err := db.wal.Close()
+	db.mu.Unlock()
+	return err
 }
 
 func (db *DB) rotateWAL() (string, error) {
