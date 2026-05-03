@@ -35,6 +35,7 @@ type DB struct {
 	manifest        *manifest.Manifest
 	flushDone       sync.Cond
 	flushErr        error
+	manifestErr     error
 	flushWg         sync.WaitGroup
 	closed          bool
 }
@@ -50,9 +51,10 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 		return nil, err
 	}
 
-	// Clean up stale rotated WALs (their data is already in SSTables)
+	// Clean up flushed WALs (their data is already in SSTables).
+	// Non-fatal: stale WALs are harmless, just waste disk space.
 	if err := cleanupStaleWALs(m); err != nil {
-		return nil, err
+		log.Printf("Warning: failed to clean up flushed WALs: %v", err)
 	}
 
 	memTable, err := wal.ReplayWAL(walFilePath)
@@ -60,8 +62,10 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 		return nil, err
 	}
 
+	// Replay rotated WALs if any (crash recovery: WAL was rotated
+	// but the MemTable wasn't flushed to an SSTable before the process died).
 	var rotatedMemTable *memtable.MemTable
-	if len(m.RotatedWALs) != 0 {
+	if len(m.RotatedWALs) > 0 {
 		rotatedMemTable, err = wal.ReplayWAL(m.RotatedWALs[0].Path)
 		if err != nil {
 			return nil, err
@@ -73,26 +77,91 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{
+	db := &DB{
 		memTable:        memTable,
 		rotatedMemTable: rotatedMemTable,
 		maxMemTableSize: maxMemTableSize,
 		wal:             walFile,
 		walPath:         walFilePath,
 		manifest:        m,
-	}, nil
+	}
+	db.flushDone = *sync.NewCond(&db.mu)
+
+	// If we have a rotated MemTable (crash recovery), flush it synchronously
+	// before accepting any writes. This is safe because no goroutines are
+	// running yet, so no lock is needed.
+	if db.rotatedMemTable != nil {
+		// Phase 1: Write SSTable to disk (don't write manifest yet)
+		seqNum := db.manifest.SSTSeqNum
+		sstPath := fmt.Sprintf("%s/data-%d.sstable", sstDir, seqNum)
+		result, err := sstable.WriteSST(db.rotatedMemTable, sstPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to flush rotated MemTable on startup: %w", err)
+		}
+		// Capture the rotated WAL before we modify the slice — needed for rollback.
+		rotatedWAL := db.manifest.RotatedWALs[0]
+		// Phase 2: Update ALL in-memory manifest state
+		db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
+		db.manifest.SSTSeqNum++
+		db.manifest.FlushedWALs = append(db.manifest.FlushedWALs, rotatedWAL)
+		db.manifest.RotatedWALs = db.manifest.RotatedWALs[1:]
+		db.rotatedMemTable = nil
+		// Phase 3: Persist manifest ONCE (atomic)
+		if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
+			// Manifest write failed — full rollback
+			if removeErr := os.Remove(sstPath); removeErr != nil {
+				return nil, fmt.Errorf(
+					"manifest write failed (%v) AND SSTable cleanup failed (%v): manual recovery needed",
+					err, removeErr,
+				)
+			}
+			// Undo in-memory state
+			db.manifest.SSTSeqNum--
+			level := db.manifest.Levels[manifest.LevelZero]
+			if len(level.Files) > 0 {
+				lastFile := level.Files[len(level.Files)-1]
+				level.CurrentSize -= lastFile.Size
+				level.Files = level.Files[:len(level.Files)-1]
+			}
+			db.manifest.FlushedWALs = db.manifest.FlushedWALs[:len(db.manifest.FlushedWALs)-1]
+			db.manifest.RotatedWALs = append([]*manifest.WAL{rotatedWAL}, db.manifest.RotatedWALs...)
+
+			return nil, fmt.Errorf("manifest write failed on startup: %w", err)
+		}
+		// Only NOW is it safe to delete the WAL file
+		if err := cleanupStaleWALs(db.manifest); err != nil {
+			log.Printf("Warning: failed to clean up flushed WALs on startup: %v", err)
+		}
+	}
+	return db, nil
 }
 
 func (db *DB) Put(key, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	if db.closed {
+		return errors.New("DB is closed")
+	}
+
+	if db.manifestErr != nil {
+		return fmt.Errorf("DB is in inconsistent state (restart required): %w", db.manifestErr)
+	}
+
 	for db.memTable.Size >= db.maxMemTableSize {
 		if db.rotatedMemTable != nil {
-			// Unlocks mutex and waits for backgound flush to finish
+			// Wait for the background flush to finish instead of rejecting writes.
+			// Put() holds db.mu (write lock) — Wait() releases it, waits for
+			// Broadcast(), then reacquires it before returning.
 			db.flushDone.Wait()
+			if db.closed {
+				return errors.New("DB is closed")
+			}
 			if db.flushErr != nil {
 				return fmt.Errorf("DB flush error: %w", db.flushErr)
+			}
+			if db.manifestErr != nil {
+				return fmt.Errorf("DB is in inconsistent state (restart required): %w", db.manifestErr)
 			}
 			continue
 		}
@@ -101,13 +170,17 @@ func (db *DB) Put(key, value []byte) error {
 			return err
 		}
 
+		// Capture seqNum and immutable reference under the lock — these
+		// are passed to the background goroutine so it doesn't need to
+		// read db.manifest.SSTSeqNum or db.rotatedMemTable without a lock.
+		seqNum := db.manifest.SSTSeqNum
+		immutable := db.rotatedMemTable
 		db.memTable = memtable.NewMemTable()
 
-		// Add the background job to WaitGroup to support graceful shutdown
 		db.flushWg.Add(1)
 		go func() {
 			defer db.flushWg.Done()
-			db.flushRotatedMemTableAndCleanup()
+			db.flushRotatedMemTableAndCleanup(seqNum, immutable)
 		}()
 	}
 
@@ -164,10 +237,10 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 				}
 				val, err := (&sstable.SSTable{Path: f.Path}).Get(key)
 				if err != nil {
-					if err == errs.ErrKeyDeleted {
+					if errors.Is(err, errs.ErrKeyDeleted) {
 						return nil, errs.ErrKeyNotFound
 					}
-					if err == errs.ErrKeyNotFound {
+					if errors.Is(err, errs.ErrKeyNotFound) {
 						continue
 					}
 					return nil, err
@@ -183,10 +256,10 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 				if keyInRange(keyBytes, f.MinKey, f.MaxKey) {
 					val, err := (&sstable.SSTable{Path: f.Path}).Get(key)
 					if err != nil {
-						if err == errs.ErrKeyDeleted {
+						if errors.Is(err, errs.ErrKeyDeleted) {
 							return nil, errs.ErrKeyNotFound
 						}
-						if err == errs.ErrKeyNotFound {
+						if errors.Is(err, errs.ErrKeyNotFound) {
 							continue
 						}
 						return nil, err
@@ -212,30 +285,69 @@ func (db *DB) Close() error {
 	}
 	db.closed = true
 
+	// Wait for any background flush to complete.
+	for db.rotatedMemTable != nil {
+		db.flushDone.Wait()
+	}
+
+	// Log errors but don't prevent close. The data is still recoverable:
+	// - flushErr: rotated WAL on disk has the data, will be replayed on restart
+	// - manifestErr: process must be restarted for recovery
+	if db.flushErr != nil {
+		log.Printf("Warning: closing DB with flush error (data recoverable on restart): %v", db.flushErr)
+	}
+	if db.manifestErr != nil {
+		log.Printf("Warning: closing DB with manifest error (restart required): %v", db.manifestErr)
+	}
+
+	// Flush the current (mutable) MemTable synchronously if it has data.
+	// Only flush if there's no manifest error — the admin needs to restart
+	// to recover from that state.
+	if db.memTable.Size > 0 && db.manifestErr == nil {
+		seqNum := db.manifest.SSTSeqNum
+
+		// Phase 1: Write SSTable (no lock needed — db.closed=true, no concurrent writers)
+		db.mu.Unlock()
+		result, err := sstable.WriteSST(db.memTable, fmt.Sprintf("%s/data-%d.sstable", sstDir, seqNum))
+		if err != nil {
+			log.Printf("Warning: failed to flush MemTable during close: %v", err)
+			db.mu.Lock()
+		} else {
+			// Phase 2: Update manifest (under lock)
+			db.mu.Lock()
+			db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
+			db.manifest.SSTSeqNum++
+
+			if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
+				log.Printf("Warning: manifest write failed during close: %v", err)
+				sstPath := fmt.Sprintf("%s/data-%d.sstable", sstDir, seqNum)
+				os.Remove(sstPath)
+				db.manifest.SSTSeqNum--
+				level := db.manifest.Levels[manifest.LevelZero]
+				if len(level.Files) > 0 {
+					lastFile := level.Files[len(level.Files)-1]
+					level.CurrentSize -= lastFile.Size
+					level.Files = level.Files[:len(level.Files)-1]
+				}
+			}
+
+			db.memTable = memtable.NewMemTable()
+		}
+	}
+
+	// Wait for all background goroutines (including WAL cleanup) to finish.
 	db.mu.Unlock()
-	// Wait for any background flushing operations to finish
 	db.flushWg.Wait()
 	db.mu.Lock()
 
-	// Flush the current MemTable synchronously if it has data.
-	if db.memTable.Size > 0 {
-		ssTablePath := fmt.Sprintf("%s/data-%d.sstable", sstDir, db.manifest.SSTSeqNum)
-		result, err := sstable.WriteSST(db.memTable, ssTablePath)
-		if err != nil {
-			db.mu.Unlock()
-			return err
-		}
-		db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
-		db.manifest.SSTSeqNum++
-		manifest.WriteToFile(manifestPath, db.manifest)
-	}
-
-	// Close the WAL.
 	err := db.wal.Close()
 	db.mu.Unlock()
 	return err
 }
 
+// rotateWAL closes the current WAL, renames it to a rotated path, creates
+// a new WAL, and updates the manifest. If any step fails after the WAL is
+// renamed, it attempts to roll back to maintain consistency.
 func (db *DB) rotateWAL() (string, error) {
 	if err := db.wal.Close(); err != nil {
 		return "", err
@@ -254,16 +366,32 @@ func (db *DB) rotateWAL() (string, error) {
 	db.manifest.WALSeqNum++
 
 	if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
+		// Manifest write failed after WAL rotation — attempt rollback.
+		log.Printf("CRITICAL: manifest write failed after WAL rotation: %v", err)
+		if renameErr := os.Rename(rotatedPath, db.walPath); renameErr != nil {
+			log.Printf("CRITICAL: WAL rollback also failed: %v (manual recovery needed)", renameErr)
+		} else {
+			// Rolled back WAL. Undo in-memory manifest changes.
+			db.manifest.RotatedWALs = db.manifest.RotatedWALs[:len(db.manifest.RotatedWALs)-1]
+			db.manifest.WALSeqNum--
+			// Try to reopen the WAL at its original path.
+			if reopenWAL, reopenErr := wal.NewWAL(db.walPath); reopenErr == nil {
+				db.wal = reopenWAL
+			}
+		}
 		return "", err
 	}
 
 	newWAL, err := wal.NewWAL(db.walPath)
 	if err != nil {
+		// New WAL creation failed. The rotated WAL is on disk and referenced
+		// in the manifest. On restart, RotatedWALs will be replayed — no data loss.
+		// But we can't accept writes without a WAL.
+		log.Printf("CRITICAL: new WAL creation failed after rotation: %v", err)
 		return "", err
 	}
 
 	db.wal = newWAL
-
 	return rotatedPath, nil
 }
 
@@ -279,67 +407,105 @@ func (db *DB) rotateMemTable() error {
 	return nil
 }
 
-func (db *DB) flushRotatedMemTableAndCleanup() {
+// flushRotatedMemTableAndCleanup retries the flush up to maxRetries times
+// with exponential backoff. It breaks out of the retry loop immediately if
+// manifestErr is set, since that indicates an inconsistent state that requires
+// a restart.
+func (db *DB) flushRotatedMemTableAndCleanup(seqNum uint, immutable *memtable.MemTable) {
 	const maxRetries = 3
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
 			time.Sleep(time.Duration(1<<uint(i)) * 500 * time.Millisecond)
-			// 500ms, 1s, 2s
 			log.Printf("Retrying flush (attempt %d/%d)...", i+1, maxRetries)
 		}
-		lastErr = db.flushRotatedMemTable()
+		lastErr = db.flushRotatedMemTable(seqNum, immutable)
 		if lastErr == nil {
 			db.flushDone.Broadcast()
 			return
 		}
 		log.Printf("Flush attempt %d failed: %v", i+1, lastErr)
+
+		// Don't retry manifest errors — they require external intervention.
+		db.mu.Lock()
+		if db.manifestErr != nil {
+			db.mu.Unlock()
+			break
+		}
+		db.mu.Unlock()
 	}
 
-	// All retries exhausted — set error state
+	// All retries exhausted (or manifest error encountered).
 	db.mu.Lock()
 	db.flushErr = lastErr
 	db.mu.Unlock()
-	db.flushDone.Broadcast() // wake any waiting Put() calls
+	db.flushDone.Broadcast()
 }
 
-func (db *DB) flushRotatedMemTable() error {
-	immutableRotatedMemTable := db.rotatedMemTable
-	ssTablePath := fmt.Sprintf("%s/data-%d.sstable", sstDir, db.manifest.SSTSeqNum)
-	if err := os.MkdirAll(filepath.Dir(ssTablePath), 0755); err != nil {
-		return err
-	}
+// flushRotatedMemTable flushes the immutable MemTable to an SSTable and
+// updates the manifest. It uses a two-phase approach:
+//
+//	Phase 1 (no lock): Write SSTable to disk — pure I/O, no shared state.
+//	Phase 2 (under lock): Update manifest, move WALs, clear rotatedMemTable.
+//
+// seqNum and immutable are captured under db.mu in Put() and passed here
+// to avoid accessing shared state without a lock.
+func (db *DB) flushRotatedMemTable(seqNum uint, immutable *memtable.MemTable) error {
+	// Phase 1 (no lock): Write SSTable to disk.
+	// immutable is read-only, seqNum was captured under the lock in Put().
+	ssTablePath := fmt.Sprintf("%s/data-%d.sstable", sstDir, seqNum)
 
-	if err := utils.SyncDir(ssTablePath); err != nil {
-		return err
-	}
-
-	log.Printf("Flushing MemTable to file %s", ssTablePath)
-	result, err := sstable.WriteSST(immutableRotatedMemTable, ssTablePath)
+	result, err := sstable.WriteSST(immutable, ssTablePath)
 	if err != nil {
 		return err
 	}
 
+	// Phase 2 (under lock): Update manifest and shared state.
 	db.mu.Lock()
+
 	db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
 	db.manifest.SSTSeqNum++
 
 	if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
-		return err
+		// Manifest write failed after SSTable was written to disk.
+		// Attempt rollback: remove orphaned SSTable, undo in-memory changes.
+		log.Printf("CRITICAL: manifest write failed: %v", err)
+		if removeErr := os.Remove(ssTablePath); removeErr != nil {
+			// Rollback also failed — DB is truly inconsistent.
+			db.manifestErr = fmt.Errorf("manifest write failed (%v) AND SSTable cleanup failed (%v)", err, removeErr)
+			db.mu.Unlock()
+			return db.manifestErr
+		}
+		// Rollback succeeded — state is clean, can retry.
+		db.manifest.SSTSeqNum--
+		level := db.manifest.Levels[manifest.LevelZero]
+		if len(level.Files) > 0 {
+			lastFile := level.Files[len(level.Files)-1]
+			level.CurrentSize -= lastFile.Size
+			level.Files = level.Files[:len(level.Files)-1]
+		}
+		db.mu.Unlock()
+		return fmt.Errorf("manifest write failed (SSTable cleaned up): %w", err)
 	}
+
 	log.Println("Successfully flushed MemTable!")
 
-	db.rotatedMemTable = nil
+	// Move WAL from RotatedWALs → FlushedWALs (data is now in an SSTable,
+	// so the WAL is safe to delete).
 	db.manifest.FlushedWALs = append(db.manifest.FlushedWALs, db.manifest.RotatedWALs[0])
 	db.manifest.RotatedWALs = db.manifest.RotatedWALs[1:]
+
+	db.rotatedMemTable = nil
 	db.mu.Unlock()
 
-	// Cleans stale rotated WALs in Background
+	// Phase 3 (background): Clean up flushed WAL files.
+	// Tracked by flushWg so Close() can wait for this to finish.
+	db.flushWg.Add(1)
 	go func() {
-		// Clean up stale rotated WALs (their data is already in SSTables)
-		if err := cleanupStaleWALs(db.manifest); err != nil {
-			fmt.Printf("Failed cleaning up stale WALs: %v", err.Error())
-		}
+		defer db.flushWg.Done()
+		db.mu.Lock()
+		cleanupStaleWALs(db.manifest)
+		db.mu.Unlock()
 	}()
 
 	return nil
@@ -401,6 +567,9 @@ func cleanupTmpFiles(dir string) error {
 	return nil
 }
 
+// cleanupStaleWALs deletes WAL files listed in FlushedWALs and removes
+// them from the manifest. The caller must hold db.mu or be in a single-
+// threaded context (like NewDB).
 func cleanupStaleWALs(m *manifest.Manifest) error {
 	if len(m.FlushedWALs) == 0 {
 		return nil
@@ -418,5 +587,4 @@ func cleanupStaleWALs(m *manifest.Manifest) error {
 	}
 
 	return nil
-
 }

@@ -64,6 +64,7 @@ func NewManifest() *Manifest {
 	}
 
 	return &Manifest{
+		RotatedWALs: make([]*WAL, 0),
 		FlushedWALs: make([]*WAL, 0),
 		Levels:      levels,
 	}
@@ -104,14 +105,18 @@ func WriteToFile(path string, manifest *Manifest) error {
 	}
 
 	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
 		return err
 	}
 
 	if err := file.Close(); err != nil {
+		os.Remove(tmpPath)
 		return err
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
 		return err
 	}
 

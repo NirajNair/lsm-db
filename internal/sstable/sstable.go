@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 
 	types "github.com/NirajNair/lsm-db/internal"
 	"github.com/NirajNair/lsm-db/internal/errs"
@@ -34,6 +35,14 @@ type WriteResult struct {
 }
 
 func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, err
+	}
+
+	if err := utils.SyncDir(path); err != nil {
+		return nil, err
+	}
+
 	tmpFile, err := os.Create(path + ".tmp")
 	if err != nil {
 		return nil, err
@@ -65,13 +74,17 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 	}
 
 	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(path + ".tmp")
 		return nil, err
 	}
 	if err := tmpFile.Close(); err != nil {
+		os.Remove(path + ".tmp")
 		return nil, err
 	}
 
 	if err := os.Rename(path+".tmp", path); err != nil {
+		os.Remove(path + ".tmp")
 		return nil, err
 	}
 
