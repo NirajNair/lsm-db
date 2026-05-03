@@ -2,13 +2,10 @@ package sstable
 
 import (
 	"bytes"
-	"encoding/gob"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 
-	types "github.com/NirajNair/lsm-db/internal"
 	"github.com/NirajNair/lsm-db/internal/errs"
 	"github.com/NirajNair/lsm-db/internal/memtable"
 	"github.com/NirajNair/lsm-db/internal/utils"
@@ -48,16 +45,13 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 		return nil, err
 	}
 
-	encoder := gob.NewEncoder(tmpFile)
+	var buf []byte
 	var minKey, maxKey []byte
 	first := true
 
 	err = memTable.ForEach(func(key, value []byte) error {
-		pair := types.Entry{
-			Key:   key,
-			Value: value,
-		}
-		if err := encoder.Encode(pair); err != nil {
+		buf = utils.EncodeEntry(buf[:0], key, value)
+		if _, err := tmpFile.Write(buf); err != nil {
 			return err
 		}
 		if first {
@@ -101,33 +95,28 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 
 func (sst *SSTable) Get(key []byte) ([]byte, error) {
 	log.Printf("Searching Key: %v in SSTable: %s", key, sst.Path)
-	file, err := os.Open(sst.Path)
+	data, err := os.ReadFile(sst.Path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	decoder := gob.NewDecoder(file)
-
-	for {
-		var pair types.Entry
-		if err := decoder.Decode(&pair); err != nil {
-			if err == io.EOF {
-				break
-			}
+	offset := 0
+	for offset < len(data) {
+		entryKey, entryValue, n, err := utils.DecodeEntry(data[offset:])
+		if err != nil {
 			return nil, err
 		}
+		offset += n
 
-		cmp := bytes.Compare(pair.Key, key)
+		cmp := bytes.Compare(entryKey, key)
 		if cmp == 0 {
-			if IsTombstone(pair.Value) {
+			if IsTombstone(entryValue) {
 				return nil, errs.ErrKeyDeleted
 			}
-			return pair.Value, nil
+			return entryValue, nil
 		}
 
 		if cmp > 0 {
-			// Past the point where the key could exist (SST is sorted)
 			return nil, errs.ErrKeyNotFound
 		}
 	}

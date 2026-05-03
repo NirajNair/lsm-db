@@ -1,19 +1,17 @@
 package wal
 
 import (
-	"encoding/gob"
-	"io"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
-	types "github.com/NirajNair/lsm-db/internal"
 	"github.com/NirajNair/lsm-db/internal/memtable"
 	"github.com/NirajNair/lsm-db/internal/utils"
 )
 
 type WAL struct {
-	file    *os.File
-	encoder *gob.Encoder
+	file *os.File
 }
 
 func NewWAL(path string) (*WAL, error) {
@@ -31,28 +29,20 @@ func NewWAL(path string) (*WAL, error) {
 	}
 
 	return &WAL{
-		file:    file,
-		encoder: gob.NewEncoder(file),
+		file: file,
 	}, nil
 }
 
 func (w *WAL) Write(key, value []byte) (int, error) {
-	entry := &types.Entry{Key: key, Value: value}
-	currentOffset, err := w.file.Seek(0, io.SeekCurrent)
+	encoded := utils.EncodeEntry(nil, key, value)
+	n, err := w.file.Write(encoded)
 	if err != nil {
-		return 0, err
-	}
-	if err := w.encoder.Encode(entry); err != nil {
 		return 0, err
 	}
 	if err := w.file.Sync(); err != nil {
 		return 0, err
 	}
-	newOffset, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	return int(newOffset - currentOffset), nil
+	return n, nil
 }
 
 func (w *WAL) Close() error {
@@ -65,7 +55,6 @@ func (w *WAL) Close() error {
 func ReplayWAL(path string) (*memtable.MemTable, error) {
 	memTable := memtable.NewMemTable()
 
-	// Return the empty MemTable if WAL file does not exist
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -74,23 +63,25 @@ func ReplayWAL(path string) (*memtable.MemTable, error) {
 		return nil, err
 	}
 
-	file, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	decoder := gob.NewDecoder(file)
-	for {
-		var entry types.Entry
-		if err := decoder.Decode(&entry); err != nil {
-			if err == io.EOF {
-				break
+	offset := 0
+	for offset < len(data) {
+		key, value, n, err := utils.DecodeEntry(data[offset:])
+		if err != nil {
+			if offset == 0 {
+				return nil, fmt.Errorf("WAL replay: failed to decode first entry: %w", err)
 			}
-			return nil, err
+			log.Printf("WAL replay: truncated entry at offset %d: %v", offset, err)
+			break
 		}
-		memTable.Put(entry.Key, entry.Value)
+		memTable.Put(key, value)
+		offset += n
 	}
+
 	memTable.Size = uint(fileInfo.Size())
 	return memTable, nil
 }
