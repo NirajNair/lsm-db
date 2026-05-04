@@ -101,7 +101,7 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 		// Capture the rotated WAL before we modify the slice — needed for rollback.
 		rotatedWAL := db.manifest.RotatedWALs[0]
 		// Phase 2: Update ALL in-memory manifest state
-		db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
+		db.manifest.AddSSTable(result.SST.Path, manifest.L0, result.MinKey, result.MaxKey)
 		db.manifest.SSTSeqNum++
 		db.manifest.FlushedWALs = append(db.manifest.FlushedWALs, rotatedWAL)
 		db.manifest.RotatedWALs = db.manifest.RotatedWALs[1:]
@@ -117,7 +117,7 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 			}
 			// Undo in-memory state
 			db.manifest.SSTSeqNum--
-			level := db.manifest.Levels[manifest.LevelZero]
+			level := db.manifest.Levels[manifest.L0]
 			if len(level.Files) > 0 {
 				lastFile := level.Files[len(level.Files)-1]
 				level.CurrentSize -= lastFile.Size
@@ -227,7 +227,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	keyBytes := key
 
 	for _, level := range db.manifest.Levels {
-		if level.Level == manifest.LevelZero {
+		if level.Level == manifest.L0 {
 			// L0: check newest files first, skip files whose range
 			// doesn't contain the key.
 			for i := len(level.Files) - 1; i >= 0; i-- {
@@ -315,7 +315,7 @@ func (db *DB) Close() error {
 		} else {
 			// Phase 2: Update manifest (under lock)
 			db.mu.Lock()
-			db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
+			db.manifest.AddSSTable(result.SST.Path, manifest.L0, result.MinKey, result.MaxKey)
 			db.manifest.SSTSeqNum++
 
 			if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
@@ -323,7 +323,7 @@ func (db *DB) Close() error {
 				sstPath := fmt.Sprintf("%s/data-%d.sstable", sstDir, seqNum)
 				os.Remove(sstPath)
 				db.manifest.SSTSeqNum--
-				level := db.manifest.Levels[manifest.LevelZero]
+				level := db.manifest.Levels[manifest.L0]
 				if len(level.Files) > 0 {
 					lastFile := level.Files[len(level.Files)-1]
 					level.CurrentSize -= lastFile.Size
@@ -463,7 +463,7 @@ func (db *DB) flushRotatedMemTable(seqNum uint, immutable *memtable.MemTable) er
 	// Phase 2 (under lock): Update manifest and shared state.
 	db.mu.Lock()
 
-	db.manifest.AddSSTable(result.SST.Path, manifest.LevelZero, result.MinKey, result.MaxKey)
+	db.manifest.AddSSTable(result.SST.Path, manifest.L0, result.MinKey, result.MaxKey)
 	db.manifest.SSTSeqNum++
 
 	if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
@@ -478,7 +478,7 @@ func (db *DB) flushRotatedMemTable(seqNum uint, immutable *memtable.MemTable) er
 		}
 		// Rollback succeeded — state is clean, can retry.
 		db.manifest.SSTSeqNum--
-		level := db.manifest.Levels[manifest.LevelZero]
+		level := db.manifest.Levels[manifest.L0]
 		if len(level.Files) > 0 {
 			lastFile := level.Files[len(level.Files)-1]
 			level.CurrentSize -= lastFile.Size

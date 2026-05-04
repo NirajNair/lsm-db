@@ -10,16 +10,19 @@ import (
 type LevelNum int
 
 const (
-	LevelZero LevelNum = iota
-	LevelOne
-	LevelTwo
+	L0 LevelNum = iota
+	L1
+	L2
 )
 
 const (
-	ONE_MB           = 1 << 20
-	LevelZeroTrigger = 4 // Files
-	LevelZeroMaxSize = 4 * ONE_MB
-	LevelOneMaxSize  = LevelZeroMaxSize * LevelZeroTrigger
+	ONE_MB             = 1 << 20
+	SizeRatio          = 4
+	MaxFileSize        = ONE_MB
+	L0CompTriggerFiles = 4 // Files
+	L0MaxSize          = 4 * MaxFileSize
+	L1MaxSize          = SizeRatio * L0MaxSize
+	L2MaxSize          = SizeRatio * L1MaxSize
 )
 
 type Manifest struct {
@@ -35,15 +38,15 @@ type WAL struct {
 }
 
 type LevelMetadata struct {
-	Level       LevelNum
-	CurrentSize uint
-	MaxSize     uint
-	Files       []*FileMetadata
+	Level             LevelNum
+	CurrentSize       uint
+	MaxSize           uint
+	Files             []*FileMetadata
+	NextCompactionIdx int
 }
 
 type FileMetadata struct {
 	Path   string
-	SeqNum uint
 	MinKey []byte
 	MaxKey []byte
 	Size   uint
@@ -52,13 +55,18 @@ type FileMetadata struct {
 func NewManifest() *Manifest {
 	levels := []*LevelMetadata{
 		{
-			Level:   LevelZero,
-			MaxSize: LevelZeroMaxSize,
+			Level:   L0,
+			MaxSize: L0MaxSize,
 			Files:   make([]*FileMetadata, 0),
 		},
 		{
-			Level:   LevelOne,
-			MaxSize: LevelOneMaxSize,
+			Level:   L1,
+			MaxSize: L1MaxSize,
+			Files:   make([]*FileMetadata, 0),
+		},
+		{
+			Level:   L2,
+			MaxSize: L2MaxSize,
 			Files:   make([]*FileMetadata, 0),
 		},
 	}
@@ -69,6 +77,8 @@ func NewManifest() *Manifest {
 		Levels:      levels,
 	}
 }
+
+const NumLevels = 3
 
 func ReadManifest(path string) (*Manifest, error) {
 	file, err := os.Open(path)
@@ -87,6 +97,23 @@ func ReadManifest(path string) (*Manifest, error) {
 		return nil, err
 	}
 
+	for len(manifest.Levels) < NumLevels {
+		level := LevelNum(len(manifest.Levels))
+		var maxSize uint
+		switch level {
+		case L0:
+			maxSize = L0MaxSize
+		case L1:
+			maxSize = L1MaxSize
+		case L2:
+			maxSize = L2MaxSize
+		}
+		manifest.Levels = append(manifest.Levels, &LevelMetadata{
+			Level:   level,
+			MaxSize: maxSize,
+			Files:   make([]*FileMetadata, 0),
+		})
+	}
 	return &manifest, nil
 }
 
@@ -137,9 +164,8 @@ func (m *Manifest) AddSSTable(path string, level LevelNum, optKeys ...[]byte) er
 	fileSize := uint(fileInfo.Size())
 
 	sstFileMetadata := &FileMetadata{
-		SeqNum: m.SSTSeqNum,
-		Path:   path,
-		Size:   fileSize,
+		Path: path,
+		Size: fileSize,
 	}
 	if len(optKeys) > 0 {
 		sstFileMetadata.MinKey = optKeys[0]
@@ -151,6 +177,41 @@ func (m *Manifest) AddSSTable(path string, level LevelNum, optKeys ...[]byte) er
 	m.Levels[level].Files = append(m.Levels[level].Files, sstFileMetadata)
 	m.Levels[level].CurrentSize += fileSize
 	return nil
+}
+
+func (m *Manifest) DeepCopy() *Manifest {
+	newManifest := &Manifest{
+		SSTSeqNum:   m.SSTSeqNum,
+		WALSeqNum:   m.WALSeqNum,
+		RotatedWALs: make([]*WAL, len(m.RotatedWALs)),
+		FlushedWALs: make([]*WAL, len(m.FlushedWALs)),
+		Levels:      make([]*LevelMetadata, len(m.Levels)),
+	}
+	for i, wal := range m.RotatedWALs {
+		newManifest.RotatedWALs[i] = &WAL{Path: wal.Path}
+	}
+	for i, wal := range m.FlushedWALs {
+		newManifest.FlushedWALs[i] = &WAL{Path: wal.Path}
+	}
+	for i, level := range m.Levels {
+		newLevel := &LevelMetadata{
+			Level:             level.Level,
+			CurrentSize:       level.CurrentSize,
+			MaxSize:           level.MaxSize,
+			NextCompactionIdx: level.NextCompactionIdx,
+			Files:             make([]*FileMetadata, len(level.Files)),
+		}
+		for j, f := range level.Files {
+			newLevel.Files[j] = &FileMetadata{
+				Path:   f.Path,
+				MinKey: append([]byte(nil), f.MinKey...),
+				MaxKey: append([]byte(nil), f.MaxKey...),
+				Size:   f.Size,
+			}
+		}
+		newManifest.Levels[i] = newLevel
+	}
+	return newManifest
 }
 
 // Adds rotated WALs path to Manifest.
