@@ -21,6 +21,11 @@ func IsTombstone(value []byte) bool {
 	return len(value) == 1 && value[0] == 0x00
 }
 
+type Entry struct {
+	Key   []byte
+	Value []byte
+}
+
 type SSTable struct {
 	Path string
 }
@@ -31,11 +36,14 @@ type WriteResult struct {
 	MaxKey []byte
 }
 
-func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
+func WriteSSTFromEntries(entries []Entry, path string) (*WriteResult, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-
 	if err := utils.SyncDir(path); err != nil {
 		return nil, err
 	}
@@ -46,25 +54,16 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 	}
 
 	var buf []byte
-	var minKey, maxKey []byte
-	first := true
+	minKey := entries[0].Key
+	maxKey := entries[len(entries)-1].Key
 
-	err = memTable.ForEach(func(key, value []byte) error {
-		buf = utils.EncodeEntry(buf[:0], key, value)
+	for _, e := range entries {
+		buf = utils.EncodeEntry(buf[:0], e.Key, e.Value)
 		if _, err := tmpFile.Write(buf); err != nil {
-			return err
+			tmpFile.Close()
+			os.Remove(path + ".tmp")
+			return nil, err
 		}
-		if first {
-			minKey = key
-			first = false
-		}
-		maxKey = key
-		return nil
-	})
-	if err != nil {
-		tmpFile.Close()
-		os.Remove(path + ".tmp")
-		return nil, err
 	}
 
 	if err := tmpFile.Sync(); err != nil {
@@ -91,6 +90,18 @@ func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
 		MinKey: minKey,
 		MaxKey: maxKey,
 	}, nil
+}
+
+func WriteSST(memTable *memtable.MemTable, path string) (*WriteResult, error) {
+	var entries []Entry
+	err := memTable.ForEach(func(key, value []byte) error {
+		entries = append(entries, Entry{Key: key, Value: value})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return WriteSSTFromEntries(entries, path)
 }
 
 func (sst *SSTable) Get(key []byte) ([]byte, error) {
@@ -123,3 +134,4 @@ func (sst *SSTable) Get(key []byte) ([]byte, error) {
 
 	return nil, errs.ErrKeyNotFound
 }
+
