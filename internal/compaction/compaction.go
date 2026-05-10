@@ -2,8 +2,11 @@ package compaction
 
 import (
 	"bytes"
+	"fmt"
+	"sort"
 
 	"github.com/NirajNair/lsm-db/internal/manifest"
+	"github.com/NirajNair/lsm-db/internal/sstable"
 )
 
 const MaxCascadeDepth = 10
@@ -87,6 +90,121 @@ func UpdateNextCompactionIdx(m *manifest.Manifest, level manifest.LevelNum) {
 	}
 }
 
+// Execute runs a compaction by creating iterators for source+target files,
+// merging them via MergeAndSplit, and returning the results.
+// It generates output file paths using the manifest's SSTSeqNum and advances
+// SSTSeqNum by the number of output files written.
+func Execute(c *Compaction, m *manifest.Manifest, sstDir string) ([]*sstable.WriteResult, error) {
+	var iters []*sstable.SSTIter
+	var priorities []int
+	var iterIndices []int
+
+	// Source files get priority 0 (highest), iterIndices 0..len(source)-1
+	for i, f := range c.SourceFiles {
+		sst := &sstable.SSTable{Path: f.Path}
+		iter, err := sst.NewIterator()
+		if err != nil {
+			return nil, fmt.Errorf("create iterator for %s: %w", f.Path, err)
+		}
+		iters = append(iters, iter)
+		priorities = append(priorities, 0)
+		iterIndices = append(iterIndices, i)
+	}
+
+	// Target files get priority 1, iterIndices continue from len(source)
+	for i, f := range c.TargetFiles {
+		sst := &sstable.SSTable{Path: f.Path}
+		iter, err := sst.NewIterator()
+		if err != nil {
+			return nil, fmt.Errorf("create iterator for %s: %w", f.Path, err)
+		}
+		iters = append(iters, iter)
+		priorities = append(priorities, 1)
+		iterIndices = append(iterIndices, len(c.SourceFiles)+i)
+	}
+
+	// Generate file paths for output SSTables.
+	// Worst case: all files merge into one, but may need multiple.
+	// Pre-allocate paths for up to len(source) + len(target) output files.
+	maxOutputs := max(len(c.SourceFiles)+len(c.TargetFiles), 1)
+	var filePaths []string
+	for i := range maxOutputs {
+		filePaths = append(filePaths, fmt.Sprintf("%s/data-%d.sstable", sstDir, m.SSTSeqNum+uint(i)))
+	}
+
+	results, err := sstable.MergeAndSplit(iters, priorities, iterIndices, filePaths, c.IsLastLevel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update SSTSeqNum based on how many files were actually used
+	if len(results) > 0 {
+		m.SSTSeqNum += uint(len(results))
+	}
+
+	return results, nil
+}
+
+// ApplyCompaction updates the manifest in-memory state after a successful
+// compaction: removes source and target files from their levels, adds new
+// output files to the target level, recalculates sizes, sorts by MinKey,
+// and advances the round-robin cursor.
+func ApplyCompaction(c *Compaction, results []*sstable.WriteResult, m *manifest.Manifest) {
+	// 1. Remove source files from source level
+	sourcePaths := make(map[string]bool)
+	for _, f := range c.SourceFiles {
+		sourcePaths[f.Path] = true
+	}
+	newSourceFiles := make([]*manifest.FileMetadata, 0)
+	for _, f := range m.Levels[c.Level].Files {
+		if !sourcePaths[f.Path] {
+			newSourceFiles = append(newSourceFiles, f)
+		}
+	}
+	m.Levels[c.Level].Files = newSourceFiles
+	m.Levels[c.Level].CurrentSize = 0
+	for _, f := range newSourceFiles {
+		m.Levels[c.Level].CurrentSize += f.Size
+	}
+
+	// 2. Remove target files from target level
+	targetPaths := make(map[string]bool)
+	for _, f := range c.TargetFiles {
+		targetPaths[f.Path] = true
+	}
+	newTargetFiles := make([]*manifest.FileMetadata, 0)
+	for _, f := range m.Levels[c.TargetLevel].Files {
+		if !targetPaths[f.Path] {
+			newTargetFiles = append(newTargetFiles, f)
+		}
+	}
+
+	// 3. Add new files to target level
+	m.Levels[c.TargetLevel].Files = newTargetFiles
+	for _, r := range results {
+		m.Levels[c.TargetLevel].Files = append(m.Levels[c.TargetLevel].Files, &manifest.FileMetadata{
+			Path:   r.SST.Path,
+			MinKey: r.MinKey,
+			MaxKey: r.MaxKey,
+			Size:   r.Size,
+		})
+	}
+
+	// 4. Recalculate target level size
+	m.Levels[c.TargetLevel].CurrentSize = 0
+	for _, f := range m.Levels[c.TargetLevel].Files {
+		m.Levels[c.TargetLevel].CurrentSize += f.Size
+	}
+
+	// 5. Sort target level by MinKey
+	sort.Slice(m.Levels[c.TargetLevel].Files, func(i, j int) bool {
+		return bytes.Compare(m.Levels[c.TargetLevel].Files[i].MinKey, m.Levels[c.TargetLevel].Files[j].MinKey) < 0
+	})
+
+	// 6. Advance round-robin cursor for the source level
+	UpdateNextCompactionIdx(m, c.Level)
+}
+
 // keyRangesOverlap returns true if the key ranges [minA, maxA] and [minB, maxB]
 // overlap. If either range is empty (nil/zero-length min or max), it overlaps
 // with everything as a safety default.
@@ -96,4 +214,3 @@ func keyRangesOverlap(minA, maxA, minB, maxB []byte) bool {
 	}
 	return bytes.Compare(maxA, minB) >= 0 && bytes.Compare(minA, maxB) <= 0
 }
-

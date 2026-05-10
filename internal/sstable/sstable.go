@@ -34,6 +34,7 @@ type WriteResult struct {
 	SST    *SSTable
 	MinKey []byte
 	MaxKey []byte
+	Size   uint
 }
 
 func WriteSSTFromEntries(entries []Entry, path string) (*WriteResult, error) {
@@ -134,4 +135,3 @@ func (sst *SSTable) Get(key []byte) ([]byte, error) {
 
 	return nil, errs.ErrKeyNotFound
 }
-
