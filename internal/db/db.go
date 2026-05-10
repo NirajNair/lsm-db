@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NirajNair/lsm-db/internal/compaction"
 	"github.com/NirajNair/lsm-db/internal/errs"
 	"github.com/NirajNair/lsm-db/internal/manifest"
 	"github.com/NirajNair/lsm-db/internal/memtable"
@@ -49,6 +50,11 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 	m, err := manifest.ReadManifest(manifestPath)
 	if err != nil {
 		return nil, err
+	}
+
+	// Clean up orphan SSTable files (crash recovery).
+	if err := ReconcileSSTDir(m, sstDir); err != nil {
+		log.Printf("Warning: SSTDir reconciliation failed: %v", err)
 	}
 
 	// Clean up flushed WALs (their data is already in SSTables).
@@ -133,6 +139,12 @@ func NewDB(maxMemTableSize uint) (*DB, error) {
 			log.Printf("Warning: failed to clean up flushed WALs on startup: %v", err)
 		}
 	}
+
+	// Run startup compaction if any levels need it.
+	if err := db.compactLoop(); err != nil {
+		log.Printf("Warning: startup compaction failed: %v", err)
+	}
+
 	return db, nil
 }
 
@@ -422,6 +434,14 @@ func (db *DB) flushRotatedMemTableAndCleanup(seqNum uint, immutable *memtable.Me
 		lastErr = db.flushRotatedMemTable(seqNum, immutable)
 		if lastErr == nil {
 			db.flushDone.Broadcast()
+
+			// After successful flush, run compaction cascade.
+			if err := db.compactLoop(); err != nil {
+				log.Printf("Compaction error: %v", err)
+				db.mu.Lock()
+				db.manifestErr = err
+				db.mu.Unlock()
+			}
 			return
 		}
 		log.Printf("Flush attempt %d failed: %v", i+1, lastErr)
@@ -511,6 +531,82 @@ func (db *DB) flushRotatedMemTable(seqNum uint, immutable *memtable.MemTable) er
 	return nil
 }
 
+// compactLoop runs compaction in a cascade until no level triggers
+// compaction. It follows the same lock pattern as flushRotatedMemTable:
+// lock for manifest reads/writes, unlock for disk I/O.
+//
+// Called from:
+//  1. flushRotatedMemTableAndCleanup (background goroutine) after successful flush
+//  2. NewDB (single-threaded) for startup compaction
+func (db *DB) compactLoop() error {
+	for i := 0; i < compaction.MaxCascadeDepth; i++ {
+		db.mu.Lock()
+		shouldCompact, level := compaction.ShouldCompact(db.manifest)
+		if !shouldCompact {
+			db.mu.Unlock()
+			return nil
+		}
+		c := compaction.PickFiles(db.manifest, level)
+		if c == nil {
+			db.mu.Unlock()
+			return nil
+		}
+
+		// Capture the next sequence number under the lock to prevent
+		// races with concurrent flush goroutines that also advance SSTSeqNum.
+		startSeqNum := db.manifest.SSTSeqNum
+
+		// Snapshot manifest state in case we need to rollback after ApplyCompaction.
+		snapshot := db.manifest.DeepCopy()
+		db.mu.Unlock()
+
+		// Phase 1 (no lock): Execute compaction — read/merge SSTables (I/O).
+		results, err := compaction.Execute(c, sstDir, startSeqNum)
+		if err != nil {
+			return fmt.Errorf("compaction L%d→L%d execute failed: %w", c.Level, c.TargetLevel, err)
+		}
+
+		// Phase 2 (under lock): Update manifest, advance SSTSeqNum, write to disk.
+		db.mu.Lock()
+		compaction.ApplyCompaction(c, results, db.manifest)
+		db.manifest.SSTSeqNum = startSeqNum + uint(len(results))
+		if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
+			// Manifest write failed — rollback in-memory state.
+			log.Printf("CRITICAL: manifest write failed after compaction L%d→L%d: %v", c.Level, c.TargetLevel, err)
+			// Delete the new SSTable files we just wrote.
+			var removeErr error
+			for _, r := range results {
+				if err := os.Remove(r.SST.Path); err != nil && !os.IsNotExist(err) {
+					removeErr = err
+					log.Printf("Warning: failed to remove SSTable %s during rollback: %v", r.SST.Path, err)
+				}
+			}
+			if removeErr != nil {
+				log.Printf("CRITICAL: manifest write failed AND SSTable cleanup partially failed: ReconcileSSTDir will clean up on restart")
+			}
+			// Restore manifest from snapshot.
+			db.manifest = snapshot
+			db.mu.Unlock()
+			return fmt.Errorf("manifest write failed after compaction: %w", err)
+		}
+
+		log.Printf("Compaction L%d→L%d complete, produced %d files", c.Level, c.TargetLevel, len(results))
+		db.mu.Unlock()
+
+		// Phase 3 (background): Delete old SSTable files.
+		// Use flushWg so Close() waits for these goroutines.
+		oldFiles := append(append([]*manifest.FileMetadata{}, c.SourceFiles...), c.TargetFiles...)
+		db.flushWg.Add(1)
+		go func(files []*manifest.FileMetadata) {
+			defer db.flushWg.Done()
+			for _, f := range files {
+				os.Remove(f.Path)
+			}
+		}(oldFiles)
+	}
+	return nil
+}
+
 // keyInRange checks if keyBytes falls within [minKey, maxKey].
 // If minKey/maxKey are nil (not yet populated), returns true so we
 // can't skip the file.
@@ -586,5 +682,43 @@ func cleanupStaleWALs(m *manifest.Manifest) error {
 		m.FlushedWALs = m.FlushedWALs[1:]
 	}
 
+	return nil
+}
+
+// ReconcileSSTDir removes SSTable files on disk that are not referenced
+// by the manifest. This handles crash recovery: if the process dies after
+// writing a new SSTable but before updating the manifest (or after updating
+// the manifest but before the old SSTables are deleted), orphan files will
+// be cleaned up on restart.
+func ReconcileSSTDir(m *manifest.Manifest, dir string) error {
+	// Build set of referenced SSTable paths from manifest.
+	referenced := make(map[string]bool)
+	for _, level := range m.Levels {
+		for _, f := range level.Files {
+			referenced[f.Path] = true
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".sstable" {
+			continue
+		}
+		fullPath := filepath.Join(dir, entry.Name())
+		if !referenced[fullPath] {
+			log.Printf("ReconcileSSTDir: removing orphan %s", fullPath)
+			if err := os.Remove(fullPath); err != nil {
+				log.Printf("Warning: failed to remove orphan %s: %v", fullPath, err)
+				// Non-fatal: continue cleaning up other orphans.
+			}
+		}
+	}
 	return nil
 }

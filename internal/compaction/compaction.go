@@ -92,9 +92,9 @@ func UpdateNextCompactionIdx(m *manifest.Manifest, level manifest.LevelNum) {
 
 // Execute runs a compaction by creating iterators for source+target files,
 // merging them via MergeAndSplit, and returning the results.
-// It generates output file paths using the manifest's SSTSeqNum and advances
-// SSTSeqNum by the number of output files written.
-func Execute(c *Compaction, m *manifest.Manifest, sstDir string) ([]*sstable.WriteResult, error) {
+// It generates output file paths using startSeqNum as the base sequence number.
+// The caller is responsible for advancing SSTSeqNum under the appropriate lock.
+func Execute(c *Compaction, sstDir string, startSeqNum uint) ([]*sstable.WriteResult, error) {
 	var iters []*sstable.SSTIter
 	var priorities []int
 	var iterIndices []int
@@ -129,17 +129,12 @@ func Execute(c *Compaction, m *manifest.Manifest, sstDir string) ([]*sstable.Wri
 	maxOutputs := max(len(c.SourceFiles)+len(c.TargetFiles), 1)
 	var filePaths []string
 	for i := range maxOutputs {
-		filePaths = append(filePaths, fmt.Sprintf("%s/data-%d.sstable", sstDir, m.SSTSeqNum+uint(i)))
+		filePaths = append(filePaths, fmt.Sprintf("%s/data-%d.sstable", sstDir, startSeqNum+uint(i)))
 	}
 
 	results, err := sstable.MergeAndSplit(iters, priorities, iterIndices, filePaths, c.IsLastLevel)
 	if err != nil {
 		return nil, err
-	}
-
-	// Update SSTSeqNum based on how many files were actually used
-	if len(results) > 0 {
-		m.SSTSeqNum += uint(len(results))
 	}
 
 	return results, nil
