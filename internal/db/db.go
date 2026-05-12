@@ -282,7 +282,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("key %v not found", key)
+	return nil, errs.ErrKeyNotFound
 }
 
 func (db *DB) Delete(key []byte) error {
@@ -552,39 +552,50 @@ func (db *DB) compactLoop() error {
 			return nil
 		}
 
-		// Capture the next sequence number under the lock to prevent
-		// races with concurrent flush goroutines that also advance SSTSeqNum.
+		// Capture the next sequence number under the lock and reserve
+		// range [startSeqNum, startSeqNum+maxOutputs) to prevent races
+		// with concurrent flush goroutines that also advance SSTSeqNum.
 		startSeqNum := db.manifest.SSTSeqNum
+		maxOutputs := uint(len(c.SourceFiles) + len(c.TargetFiles))
+		if maxOutputs == 0 {
+			maxOutputs = 1
+		}
 
-		// Snapshot manifest state in case we need to rollback after ApplyCompaction.
+		// Snapshot manifest state BEFORE reserving seqnums, so rollback
+		// restores SSTSeqNum to its pre-compaction value.
 		snapshot := db.manifest.DeepCopy()
+
+		// Reserve sequence numbers: advance SSTSeqNum so concurrent
+		// flushes don't collide with our file paths.
+		db.manifest.SSTSeqNum = startSeqNum + maxOutputs
 		db.mu.Unlock()
 
 		// Phase 1 (no lock): Execute compaction — read/merge SSTables (I/O).
 		results, err := compaction.Execute(c, sstDir, startSeqNum)
 		if err != nil {
+			// Un-reserve the sequence numbers since we won't use them.
+			db.mu.Lock()
+			db.manifest.SSTSeqNum = startSeqNum
+			db.mu.Unlock()
 			return fmt.Errorf("compaction L%d→L%d execute failed: %w", c.Level, c.TargetLevel, err)
 		}
 
-		// Phase 2 (under lock): Update manifest, advance SSTSeqNum, write to disk.
+		// Phase 2 (under lock): Update manifest, adjust SSTSeqNum, write to disk.
 		db.mu.Lock()
 		compaction.ApplyCompaction(c, results, db.manifest)
+		// Adjust SSTSeqNum to actual number of files produced (may be less
+		// than maxOutputs if merging reduced the count).
 		db.manifest.SSTSeqNum = startSeqNum + uint(len(results))
 		if err := manifest.WriteToFile(manifestPath, db.manifest); err != nil {
 			// Manifest write failed — rollback in-memory state.
 			log.Printf("CRITICAL: manifest write failed after compaction L%d→L%d: %v", c.Level, c.TargetLevel, err)
 			// Delete the new SSTable files we just wrote.
-			var removeErr error
 			for _, r := range results {
 				if err := os.Remove(r.SST.Path); err != nil && !os.IsNotExist(err) {
-					removeErr = err
 					log.Printf("Warning: failed to remove SSTable %s during rollback: %v", r.SST.Path, err)
 				}
 			}
-			if removeErr != nil {
-				log.Printf("CRITICAL: manifest write failed AND SSTable cleanup partially failed: ReconcileSSTDir will clean up on restart")
-			}
-			// Restore manifest from snapshot.
+			// Restore manifest from snapshot (which has pre-compaction SSTSeqNum).
 			db.manifest = snapshot
 			db.mu.Unlock()
 			return fmt.Errorf("manifest write failed after compaction: %w", err)

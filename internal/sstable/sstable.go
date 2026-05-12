@@ -86,10 +86,16 @@ func WriteSSTFromEntries(entries []Entry, path string) (*WriteResult, error) {
 		return nil, err
 	}
 
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
 	return &WriteResult{
 		SST:    &SSTable{Path: path},
 		MinKey: minKey,
 		MaxKey: maxKey,
+		Size:   uint(fileInfo.Size()),
 	}, nil
 }
 
